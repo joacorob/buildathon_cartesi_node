@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "JS DApp",
   "dependencies": {
+    "@scure/bip32": "^1.6.2",
     "cartesi-wallet": "^1.0.5",
     "ethers": "^6.7.1",
     "viem": "^2.23.5"

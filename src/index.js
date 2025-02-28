@@ -14,24 +14,20 @@ const balances = {};
 
 /**
  * Sends a NOTICE to the Cartesi Rollup server.
- * This serves as an event that can be proven on-chain.
  * @param {string} message - Message to send.
  */
 async function sendNotice(message) {
   const payload = stringToHex(message);
-  const response = await fetch(`${ROLLUP_SERVER_URL}/notice`, {
+  await fetch(`${ROLLUP_SERVER_URL}/notice`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ payload }),
   });
-
-  console.log(`${JSON.stringify(response)}`);
-  console.log(`[NOTICE] Sent: ${payload}`);
+  console.log(`[NOTICE] Sent: ${message}`);
 }
 
 /**
  * Sends a REPORT to the Cartesi Rollup server.
- * Reports are stateless logs useful for debugging but not provable on-chain.
  * @param {string} message - Message to send.
  */
 async function sendReport(message) {
@@ -41,25 +37,56 @@ async function sendReport(message) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ payload }),
   });
-  console.log(`[REPORT] Sent: ${payload}`);
+  console.log(`[REPORT] Sent: ${message}`);
 }
 
 /**
+ * Generates a voucher for the given recipient and amount.
+ * @param {string} recipient - The Ethereum address to which the voucher is directed.
+ * @param {bigint} amount - The amount in wei.
+ */
+async function generateVoucher(recipient, amount) {
+  // Format the payload expected by Cartesi:
+  // "destination" is the address, "payload" is the data (in this case the amount in 32 bytes)
+  const payload = {
+    destination: recipient,
+    payload: ethers.toBeHex(amount, 32),
+  };
+
+  await fetch(`${ROLLUP_SERVER_URL}/voucher`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  console.log(`[VOUCHER] Sent: ${JSON.stringify(payload)}`);
+}
+
+//-------------------------------------
+// Deposit-related logic
+//-------------------------------------
+
+/**
  * Parses the deposit payload to extract the recipient address and amount.
+ * The payload should be 52 bytes: first 20 for recipient, next 32 for amount.
  * @param {string} payload - The deposit payload in hex format.
  * @returns {[string, bigint]} - The parsed recipient address and deposit amount.
  */
 function parseDepositPayload(payload) {
   try {
-    const addressData = ethers.getBytes(payload).slice(0, 20); // First 20 bytes = recipient address
-    const amountData = ethers.getBytes(payload).slice(20, 52); // Next 32 bytes = deposit amount
+    // Convert hex string to bytes
+    const bytes = ethers.getBytes(payload);
 
-    if (!addressData || addressData.length !== 20) {
-      throw new Error("Invalid deposit payload: Address extraction failed.");
+    // Expect 52 bytes: 20 for address, 32 for amount
+    if (bytes.length < 52) {
+      throw new Error("Payload too short for a deposit.");
     }
 
-    const recipient = getAddress(ethers.hexlify(addressData)); // Convert to EIP-55 address format
-    const amount = BigInt(ethers.hexlify(amountData)); // Convert hex to bigint
+    const addressData = bytes.slice(0, 20);
+    const amountData = bytes.slice(20, 52);
+
+    const recipient = getAddress(ethers.hexlify(addressData));
+    const amount = BigInt(ethers.hexlify(amountData));
 
     return [recipient, amount];
   } catch (error) {
@@ -82,14 +109,13 @@ function processDeposit(recipient, amount) {
   }
 
   balances[recipient] += amount;
-
   console.log(
     `[DEPOSIT] ${recipient} new balance = ${balances[recipient]} wei`
   );
 }
 
 //-------------------------------------
-// Handler for ADVANCE (state-changing inputs)
+// Handler for ADVANCE
 //-------------------------------------
 
 async function handleAdvance(requestData) {
@@ -97,23 +123,68 @@ async function handleAdvance(requestData) {
     console.log("----- requestData ------");
     console.log(requestData, requestData.payload);
 
-    // Extract sender from metadata (who initiated the deposit)
-    const sender = requestData.metadata.msg_sender;
+    // Let's decode payload as a string
+    const decodedString = fromHex(requestData.payload, "string");
 
-    // Parse the recipient address and amount from the payload
-    const [recipient, amount] = parseDepositPayload(requestData.payload);
+    // We attempt to parse the decoded string as JSON. If it fails,
+    // we assume it's a deposit payload.
+    let parsed;
+    let isJson = false;
+    try {
+      parsed = JSON.parse(decodedString);
+      isJson = true;
+    } catch (jsonErr) {
+      // not JSON => deposit
+    }
 
-    console.log(
-      `[ADVANCE] Deposit received: sender=${sender}, recipient=${recipient}, amount=${amount} wei`
-    );
+    if (isJson && parsed && typeof parsed === "object") {
+      // If we have JSON that includes "win" and "loss", we'll treat it as a voucher scenario
+      if (parsed.win && parsed.loss) {
+        const winner = getAddress(parsed.win);
+        const loser = getAddress(parsed.loss);
+        const loserBalance = balances[loser] || BigInt(0);
 
-    // Process the deposit and update recipient's balance
-    processDeposit(recipient, amount);
+        if (loserBalance > 0) {
+          // Generate voucher from loser to winner
+          await generateVoucher(winner, loserBalance);
 
-    // Notify the Cartesi Rollup server
-    await sendNotice(
-      `Deposit OK: recipient=${recipient}, newBalance=${balances[recipient]}`
-    );
+          // Reset loser's balance
+          balances[loser] = BigInt(0);
+          console.log(
+            `[ADVANCE] Voucher created: ${winner} receives ${loserBalance} wei from ${loser}`
+          );
+
+          await sendNotice(
+            `Voucher issued: ${winner} gets ${loserBalance} wei`
+          );
+        } else {
+          console.log(`[ADVANCE] Loser ${loser} has no balance to transfer.`);
+          await sendReport(`Loser ${loser} has no balance to transfer.`);
+        }
+      } else {
+        // If the JSON doesn't have "win" and "loss", we can decide how to handle it
+        // For now, let's just report an unknown action.
+        console.log(
+          `[ADVANCE] JSON payload unrecognized structure: ${decodedString}`
+        );
+        await sendReport(`Unrecognized JSON structure: ${decodedString}`);
+      }
+    } else {
+      // Not JSON => assume deposit
+      const [recipient, amount] = parseDepositPayload(requestData.payload);
+
+      // For logging, note who sent it
+      const sender = requestData.metadata.msg_sender;
+      console.log(
+        `Deposit from sender=${sender}, recipient=${recipient}, amount=${amount}`
+      );
+
+      processDeposit(recipient, amount);
+
+      await sendNotice(
+        `Deposit OK: recipient=${recipient}, newBalance=${balances[recipient]}`
+      );
+    }
 
     return "accept";
   } catch (err) {
@@ -124,7 +195,7 @@ async function handleAdvance(requestData) {
 }
 
 //-------------------------------------
-// Handler for INSPECT (read-only queries)
+// Handler for INSPECT
 //-------------------------------------
 
 async function handleInspect(requestData) {
