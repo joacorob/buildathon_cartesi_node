@@ -1,34 +1,11 @@
-////////////////////////////////////////////////////////////////////////////////
-// Example of a Cartesi Node in JavaScript using 'viem' for hex conversions.
-//
-// This code listens for /advance and /inspect requests from the Cartesi framework
-// and updates an internal state (in-memory balances) accordingly.
-//
-// Actions supported:
-//   1) "deposit": e.g. {action: "deposit", sender: "0xAlice", amount: 100}
-//   2) "transfer": e.g. {action: "transfer", from: "0xAlice", to: "0xBob", amount: 20}
-//
-// On a real production environment, you would:
-//   - Use a persistent database instead of in-memory objects.
-//   - Possibly refine error handling (accept vs reject).
-//   - Validate that the "from" wallet has enough balance, etc.
-//
-// By default, we connect to the ROLLUP_HTTP_SERVER_URL environment variable.
-// If not set, we fall back to "http://127.0.0.1:5004" or "http://localhost:5004",
-// depending on your setup.
-//
-// Usage:
-//   ROLLUP_HTTP_SERVER_URL="http://localhost:5004" node src/index.js
-//
-////////////////////////////////////////////////////////////////////////////////
+import { fromHex, getAddress, stringToHex } from "viem";
+import { ethers } from "ethers";
 
-const { stringToHex, hexToString } = require("viem");
-
-// The Cartesi rollup server URL, typically "http://localhost:5004" or "http://localhost:8080"
+// Cartesi Rollup server configuration
 const ROLLUP_SERVER_URL =
   process.env.ROLLUP_HTTP_SERVER_URL || "http://localhost:5004";
 
-// In-memory dictionary to store user balances (key: wallet address, value: number)
+// In-memory balance storage (key: wallet address, value: balance in wei)
 const balances = {};
 
 //-------------------------------------
@@ -36,23 +13,26 @@ const balances = {};
 //-------------------------------------
 
 /**
- * Send a NOTICE to the rollup server. This is like an "event" that can be proven on-chain.
- * @param {string} message - A string message to be noticed.
+ * Sends a NOTICE to the Cartesi Rollup server.
+ * This serves as an event that can be proven on-chain.
+ * @param {string} message - Message to send.
  */
 async function sendNotice(message) {
   const payload = stringToHex(message);
-  await fetch(`${ROLLUP_SERVER_URL}/notice`, {
+  const response = await fetch(`${ROLLUP_SERVER_URL}/notice`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ payload }),
   });
-  console.log(`[NOTICE] Sent: ${message}`);
+
+  console.log(`${JSON.stringify(response)}`);
+  console.log(`[NOTICE] Sent: ${payload}`);
 }
 
 /**
- * Send a REPORT to the rollup server. Reports are "stateless logs" without proofs.
- * Useful for debugging or logging info that doesn't need proof on-chain.
- * @param {string} message - A string message to be reported.
+ * Sends a REPORT to the Cartesi Rollup server.
+ * Reports are stateless logs useful for debugging but not provable on-chain.
+ * @param {string} message - Message to send.
  */
 async function sendReport(message) {
   const payload = stringToHex(message);
@@ -61,94 +41,84 @@ async function sendReport(message) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ payload }),
   });
-  console.log(`[REPORT] Sent: ${message}`);
+  console.log(`[REPORT] Sent: ${payload}`);
 }
 
 /**
- * Process a deposit action: { action: "deposit", sender: "0x...", amount: number }
- * Increments the balance of sender by amount.
+ * Parses the deposit payload to extract the recipient address and amount.
+ * @param {string} payload - The deposit payload in hex format.
+ * @returns {[string, bigint]} - The parsed recipient address and deposit amount.
  */
-function processDeposit(parsed) {
-  const { sender, amount } = parsed;
-  if (!sender || amount == null) {
-    throw new Error("Missing 'sender' or 'amount' in deposit input");
+function parseDepositPayload(payload) {
+  try {
+    const addressData = ethers.getBytes(payload).slice(0, 20); // First 20 bytes = recipient address
+    const amountData = ethers.getBytes(payload).slice(20, 52); // Next 32 bytes = deposit amount
+
+    if (!addressData || addressData.length !== 20) {
+      throw new Error("Invalid deposit payload: Address extraction failed.");
+    }
+
+    const recipient = getAddress(ethers.hexlify(addressData)); // Convert to EIP-55 address format
+    const amount = BigInt(ethers.hexlify(amountData)); // Convert hex to bigint
+
+    return [recipient, amount];
+  } catch (error) {
+    throw new Error(`Error parsing deposit payload: ${error.message}`);
   }
-  if (!balances[sender]) {
-    balances[sender] = 0;
-  }
-  balances[sender] += Number(amount);
-  console.log(`[DEPOSIT] ${sender} new balance = ${balances[sender]}`);
 }
 
 /**
- * Process a transfer action: { action: "transfer", from: "0x...", to: "0x...", amount: number }
- * Moves 'amount' from 'from' balance to 'to' balance, if there's enough balance.
+ * Processes a deposit and updates the recipient's balance.
+ * @param {string} recipient - Recipient's Ethereum address.
+ * @param {bigint} amount - Deposit amount in wei.
  */
-function processTransfer(parsed) {
-  const { from, to, amount } = parsed;
-  if (!from || !to || amount == null) {
-    throw new Error("Missing 'from', 'to' or 'amount' in transfer input");
+function processDeposit(recipient, amount) {
+  if (!recipient || amount == null) {
+    throw new Error("Missing recipient or amount in deposit request.");
   }
-  if (!balances[from] || balances[from] < amount) {
-    throw new Error(
-      `Insufficient balance in ${from}. Current: ${
-        balances[from] || 0
-      }, needed: ${amount}`
-    );
-  }
-  balances[from] -= Number(amount);
-  if (!balances[to]) {
-    balances[to] = 0;
-  }
-  balances[to] += Number(amount);
 
-  console.log(`[TRANSFER] from=${from}, to=${to}, amount=${amount}`);
-  console.log(`[BALANCES] from=${balances[from]}, to=${balances[to]}`);
+  if (!balances[recipient]) {
+    balances[recipient] = BigInt(0);
+  }
+
+  balances[recipient] += amount;
+
+  console.log(
+    `[DEPOSIT] ${recipient} new balance = ${balances[recipient]} wei`
+  );
 }
 
 //-------------------------------------
 // Handler for ADVANCE (state-changing inputs)
 //-------------------------------------
+
 async function handleAdvance(requestData) {
   try {
-    // The payload is in hex format, so we decode it to string
-    const decodedString = hexToString(requestData.payload);
-    console.log(`[ADVANCE] Decoded input: ${decodedString}`);
+    console.log("----- requestData ------");
+    console.log(requestData, requestData.payload);
 
-    // Parse as JSON
-    const parsed = JSON.parse(decodedString);
+    // Extract sender from metadata (who initiated the deposit)
+    const sender = requestData.metadata.msg_sender;
 
-    // Check the "action" property
-    switch (parsed.action) {
-      case "deposit":
-        processDeposit(parsed);
-        await sendNotice(
-          `Deposit OK: sender=${parsed.sender}, newBalance=${
-            balances[parsed.sender]
-          }`
-        );
-        break;
+    // Parse the recipient address and amount from the payload
+    const [recipient, amount] = parseDepositPayload(requestData.payload);
 
-      case "transfer":
-        processTransfer(parsed);
-        await sendNotice(
-          `Transfer OK: from=${parsed.from}, to=${parsed.to}, amount=${parsed.amount}`
-        );
-        break;
+    console.log(
+      `[ADVANCE] Deposit received: sender=${sender}, recipient=${recipient}, amount=${amount} wei`
+    );
 
-      default:
-        console.log("[ADVANCE] Unknown action, ignoring");
-        // Optionally we can just accept or throw an error
-        break;
-    }
+    // Process the deposit and update recipient's balance
+    processDeposit(recipient, amount);
 
-    // If everything is fine, return "accept"
+    // Notify the Cartesi Rollup server
+    await sendNotice(
+      `Deposit OK: recipient=${recipient}, newBalance=${balances[recipient]}`
+    );
+
     return "accept";
   } catch (err) {
     console.error("[ADVANCE] Error:", err.message);
-    // We can send a report with the error details
     await sendReport(`Error: ${err.message}`);
-    // Then decide if we want to reject or accept:
     return "reject";
   }
 }
@@ -156,30 +126,43 @@ async function handleAdvance(requestData) {
 //-------------------------------------
 // Handler for INSPECT (read-only queries)
 //-------------------------------------
+
 async function handleInspect(requestData) {
   try {
-    // The payload is in hex format, so decode it
-    const decodedString = hexToString(requestData.payload);
-    console.log(`[INSPECT] Decoded input: ${decodedString}`);
+    console.log("----- Inspect request ------");
+    console.log(requestData, requestData.payload);
 
-    // Parse as JSON
+    // Decode the hex payload into a JSON string
+    const decodedString = fromHex(requestData.payload, "string");
+
+    console.log("------ Decoded String -----");
+    console.log(decodedString);
+
+    // Parse JSON into an object
     const parsed = JSON.parse(decodedString);
 
-    // Let's say we expect { action: "balance", user: "0x..." } to query a balance
+    console.log("------ Parsed Object -----");
+    console.log(parsed);
+
+    // Expecting { action: "balance", user: "0x..." } to query a balance
     if (parsed.action === "balance" && parsed.user) {
-      const bal = balances[parsed.user] || 0;
-      // We'll send a report back with the balance
-      await sendReport(`Balance of ${parsed.user} = ${bal}`);
+      const userBalance = balances[parsed.user] || BigInt(0);
+
+      console.log(
+        `[INSPECT] Balance query: user=${parsed.user}, balance=${userBalance} wei`
+      );
+
+      // Send a report back with the balance
+      await sendReport(`Balance of ${parsed.user} = ${userBalance} wei`);
     } else {
-      console.log("[INSPECT] Unknown or no user specified");
-      // We can still accept
+      console.log("[INSPECT] Unknown action or missing user field");
     }
 
-    // Everything is fine
     return "accept";
   } catch (err) {
     console.error("[INSPECT] Error:", err.message);
-    // We can decide to reject or accept
+    await sendReport(`Error: ${err.message}`);
+    console.log(err);
     return "reject";
   }
 }
@@ -192,14 +175,16 @@ async function handleInspect(requestData) {
     "Cartesi Node started. Listening for rollup requests at:",
     ROLLUP_SERVER_URL
   );
+  let resultStatus = "accept";
 
   // We'll continuously ask /finish for new requests
   while (true) {
     // By default, we send 'accept' to fetch next request
+    // After handling, we finalize by sending the resultStatus back to /finish
     const finishResp = await fetch(`${ROLLUP_SERVER_URL}/finish`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "accept" }),
+      body: JSON.stringify({ status: resultStatus }),
     });
 
     if (finishResp.status === 202) {
@@ -216,8 +201,6 @@ async function handleInspect(requestData) {
 
     console.log(`[MAINLOOP] Received request_type=${request_type}`);
 
-    let resultStatus = "accept";
-
     if (request_type === "advance_state") {
       resultStatus = await handleAdvance(data);
     } else if (request_type === "inspect_state") {
@@ -225,12 +208,5 @@ async function handleInspect(requestData) {
     } else {
       console.log(`[MAINLOOP] Unknown request_type=${request_type}`);
     }
-
-    // After handling, we finalize by sending the resultStatus back to /finish
-    await fetch(`${ROLLUP_SERVER_URL}/finish`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: resultStatus }),
-    });
   }
 })();
